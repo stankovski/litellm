@@ -6,13 +6,14 @@ import inspect
 import os
 import tempfile
 import warnings
-from collections.abc import Awaitable, Callable, Iterator
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterator
 from typing import Dict, Final, Optional
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 import yaml
 from fastapi.testclient import TestClient
+from fastapi import FastAPI
 from prisma.errors import ClientNotConnectedError
 
 import litellm
@@ -22,6 +23,45 @@ from litellm.integrations.otel.model.payloads import ServiceSpanData
 from litellm.integrations.otel.model.spans import service_span_name
 from tests.unit.litellm_core_utils.fake_secret_vault import FakeSecretVault
 from tests._master_key import MASTER_KEY
+
+
+@pytest.fixture
+async def copilot_proxy(monkeypatch: pytest.MonkeyPatch, httpx_transport: None) -> AsyncIterator[FastAPI]:
+    from litellm.proxy import proxy_server
+    from litellm.proxy._types import LiteLLMRoutes, LiteLLM_UserTable
+    from litellm.proxy.common_utils.user_api_key_cache import UserApiKeyCache
+    from litellm.proxy.pass_through_endpoints import pass_through_endpoints
+
+    app: Final = FastAPI(exception_handlers=dict(proxy_server.app.exception_handlers))
+    cache: Final = UserApiKeyCache()
+    endpoints: Final = [
+        {
+            "path": f"/test-copilot/{suffix}",
+            "target": f"https://api.githubcopilot.com/{suffix}",
+            "methods": ["POST"],
+            "auth": True,
+            "custom_auth_parser": "github_copilot",
+            "forward_headers": True,
+        }
+        for suffix in ("chat/completions", "v1/messages", "responses")
+    ]
+    monkeypatch.setattr(proxy_server, "app", app)
+    monkeypatch.setattr(proxy_server, "master_key", MASTER_KEY)
+    monkeypatch.setattr(proxy_server, "general_settings", {"pass_through_endpoints": endpoints})
+    monkeypatch.setattr(proxy_server, "config_passthrough_endpoints", None)
+    monkeypatch.setattr(proxy_server, "user_custom_auth", None)
+    monkeypatch.setattr(proxy_server, "prisma_client", None)
+    monkeypatch.setattr(proxy_server, "user_api_key_cache", cache)
+    monkeypatch.setattr(pass_through_endpoints, "_registered_pass_through_routes", {})
+    await cache.async_set_cache(
+        key="copilot-user", value=LiteLLM_UserTable(user_id="copilot-user"), model_type=LiteLLM_UserTable
+    )
+    existing_routes: Final = tuple(LiteLLMRoutes.openai_routes.value)
+    try:
+        await pass_through_endpoints.initialize_pass_through_endpoints(endpoints)
+        yield app
+    finally:
+        LiteLLMRoutes.openai_routes.value[:] = existing_routes
 
 
 class StubClientNotConnectedError(ClientNotConnectedError):

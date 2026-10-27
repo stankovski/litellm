@@ -2269,6 +2269,12 @@ def request_dispatched_to_provider_pass_through(request: Request) -> bool:
     return "endpoint" in request.path_params
 
 
+def request_skips_pass_through_model_checks(request: Request | None) -> bool:
+    return request_dispatched_to_pass_through_endpoint(request) and not (
+        request is not None and getattr(request.state, "github_copilot_authenticated", False) is True
+    )
+
+
 def get_model_from_request(
     request_data: dict,
     route: str,
@@ -2281,7 +2287,8 @@ def get_model_from_request(
     """Resolve the model(s) a request targets, for model-access and budget checks.
 
     Returns ``None`` when the request was dispatched to a user-defined pass-through
-    endpoint: its body is forwarded verbatim to the configured upstream, so a
+    endpoint without authenticated Copilot model policy. Its body is forwarded
+    verbatim to the configured upstream, so a
     ``model`` field there names an upstream model, not a LiteLLM-managed one, and
     enforcing key/team model allowlists against it would reject valid requests. The
     check reads the FastAPI-resolved endpoint (``request.scope["endpoint"]``), not the
@@ -2292,7 +2299,7 @@ def get_model_from_request(
     ``LITELLM_BUILTIN_PASS_THROUGH_ROUTES_FIRST`` is set. Built-in provider passthrough
     routes (``/vertex_ai``, ``/gemini``, ...) are separate handlers and keep model enforcement.
     """
-    if request_dispatched_to_pass_through_endpoint(request):
+    if request_skips_pass_through_model_checks(request):
         return None
 
     candidates: Final = _extract_model_candidates_from_request(

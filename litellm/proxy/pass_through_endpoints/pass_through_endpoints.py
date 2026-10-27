@@ -86,7 +86,7 @@ from litellm.proxy._types import (
 from litellm.proxy.auth.auth_utils import (
     get_model_from_request,
     get_request_route,
-    request_dispatched_to_pass_through_endpoint,
+    request_skips_pass_through_model_checks,
 )
 from litellm.proxy.auth.user_api_key_auth import user_api_key_auth
 from litellm.proxy.common_request_processing import (
@@ -687,14 +687,7 @@ class HttpPassThroughEndpointHelpers(BasePassthroughUtils):
         # the post-call increment finds nothing and every passthrough request goes untracked and
         # unenforced. Set after the client merge so a request body cannot supply its own budget.
         #
-        # Only for the built-in provider routes. `get_model_from_request` returns
-        # None for a user-defined pass-through, deliberately: its body is forwarded
-        # verbatim, so `model` there names an UPSTREAM model rather than a
-        # LiteLLM-managed one. Enforcement is therefore skipped on those routes, and
-        # charging a counter anyway would track spend that nothing can refuse, and
-        # would attribute it to a budget the operator scoped to a LiteLLM model that
-        # merely shares the name.
-        if not request_dispatched_to_pass_through_endpoint(request):
+        if not request_skips_pass_through_model_checks(request):
             _metadata["model_group"] = managed_model if isinstance(managed_model, str) else None
             _metadata["user_api_key_model_max_budget"] = user_api_key_dict.model_max_budget
             _metadata["user_api_key_team_model_max_budget"] = user_api_key_dict.team_model_max_budget
@@ -3889,7 +3882,7 @@ async def update_pass_through_endpoints(
     # Find the index for updating the list
     endpoint_index = None
     for idx, endpoint in enumerate(pass_through_endpoint_data):
-        _endpoint = PassThroughGenericEndpoint(**endpoint) if isinstance(endpoint, dict) else endpoint
+        _endpoint = PassThroughGenericEndpoint.model_validate(endpoint) if isinstance(endpoint, dict) else endpoint
         if _endpoint.id == endpoint_id:
             endpoint_index = idx
             break
@@ -4121,7 +4114,7 @@ async def delete_pass_through_endpoints(
     # Find the index for deleting from the list
     endpoint_index = None
     for idx, endpoint in enumerate(pass_through_endpoint_data):
-        _endpoint = PassThroughGenericEndpoint(**endpoint) if isinstance(endpoint, dict) else endpoint
+        _endpoint = PassThroughGenericEndpoint.model_validate(endpoint) if isinstance(endpoint, dict) else endpoint
         if _endpoint.id == endpoint_id:
             endpoint_index = idx
             break
@@ -4169,7 +4162,7 @@ def _find_endpoint_by_id(
     for endpoint in endpoints_data:
         _endpoint: PassThroughGenericEndpoint | None = None
         if isinstance(endpoint, dict):
-            _endpoint = PassThroughGenericEndpoint(**endpoint)
+            _endpoint = PassThroughGenericEndpoint.model_validate(endpoint)
         elif isinstance(endpoint, PassThroughGenericEndpoint):
             _endpoint = endpoint
 

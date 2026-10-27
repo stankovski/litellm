@@ -2259,6 +2259,10 @@ class PassThroughGenericEndpoint(LiteLLMPydanticObjectBase):
         default=True,
         description="Whether authentication is required for the pass-through endpoint. Defaults to True so a pass-through silently created without an explicit value still requires a valid LiteLLM API key — set to False only if the endpoint is meant to be a public forwarder (e.g. an unauthenticated webhook target).",
     )
+    custom_auth_parser: Literal["langfuse", "github_copilot"] | None = Field(
+        default=None,
+        description="Endpoint-scoped authentication parser. github_copilot validates the client's GitHub OAuth bearer.",
+    )
     guardrails: PassThroughGuardrailsConfig | None = Field(
         default=None,
         description="Guardrails configuration for this passthrough endpoint. Dict keys are guardrail names, values are optional settings for field targeting. When set, all org/team/key level guardrails will also execute. Defaults to None (no guardrails execute).",

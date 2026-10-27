@@ -40398,6 +40398,11 @@ export interface components {
              */
             cost_per_request: number;
             /**
+             * Custom Auth Parser
+             * @description Endpoint-scoped authentication parser. github_copilot validates the client's GitHub OAuth bearer.
+             */
+            custom_auth_parser?: ("langfuse" | "github_copilot") | null;
+            /**
              * Default Query Params
              * @description Key-value pairs of default query parameters to be sent with every request to this endpoint. These can be overridden by client-provided query parameters. For example: {'key': 'default_value', 'api_version': '2023-01'}
              * @default {}
