@@ -109,12 +109,26 @@ class _CopilotObservations(CustomLogger):
 @pytest.mark.asyncio
 @pytest.mark.parametrize("suffix", ["chat/completions", "v1/messages", "responses"])
 @pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize(
+    ("copilot_proxy", "github_host", "user_id"),
+    [("github.com", "github.com", "copilot-user"), ("OCTO.ghe.com", "octo.ghe.com", "octo.ghe.com:copilot-user")],
+    indirect=["copilot_proxy"],
+)
 async def test_copilot_native_inference_preserves_credentials_body_and_stream_without_logging_secrets(
-    copilot_proxy: FastAPI, monkeypatch: pytest.MonkeyPatch, respx_mock: respx.MockRouter, suffix: str, stream: bool
+    copilot_proxy: FastAPI, monkeypatch: pytest.MonkeyPatch, respx_mock: respx.MockRouter, suffix: str, stream: bool,
+    github_host: str, user_id: str,
 ) -> None:
+    from litellm.llms.github_copilot.github_host import github_host_endpoints
+    from litellm.proxy import proxy_server
+    from litellm.proxy._types import LiteLLM_UserTable
+
+    github: Final = github_host_endpoints(github_host)
+    await proxy_server.user_api_key_cache.async_set_cache(
+        key=user_id, value=LiteLLM_UserTable(user_id=user_id), model_type=LiteLLM_UserTable
+    )
     recorder: Final = _CopilotObservations()
     monkeypatch.setattr(litellm, "_async_success_callback", [recorder])
-    validation: Final = respx_mock.get("https://api.github.com/copilot_internal/user").respond(
+    validation: Final = respx_mock.get(github.copilot_user_url).respond(
         json={"login": "copilot-user"}
     )
     body: Final = {
@@ -127,7 +141,7 @@ async def test_copilot_native_inference_preserves_credentials_body_and_stream_wi
         "usage": {"input_tokens": 2, "output_tokens": 1},
     }
     content: Final = b'event: delta\ndata: {"text":"Hello"}\n\n' if stream else json.dumps(message).encode()
-    upstream: Final = respx_mock.post(f"https://api.githubcopilot.com/{suffix}").respond(
+    upstream: Final = respx_mock.post(f"{github.default_copilot_api_base}/{suffix}").respond(
         content=content, headers={"content-type": "text/event-stream" if stream else "application/json"}
     )
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=copilot_proxy), base_url="http://test") as client:
@@ -148,9 +162,56 @@ async def test_copilot_native_inference_preserves_credentials_body_and_stream_wi
     assert upstream.calls.last.request.headers["copilot-integration-id"] == "test-integration"
     assert validation.call_count == 1
     serialized: Final = json.dumps(logged, default=str)
-    assert "copilot-user" in serialized
+    assert user_id in serialized
     assert "private-oauth" not in serialized
     assert "private-session" not in serialized
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("copilot_proxy", ["OCTO.ghe.com"], indirect=True)
+async def test_copilot_ghe_cannot_inherit_another_hosts_user_policy(
+    copilot_proxy: FastAPI, monkeypatch: pytest.MonkeyPatch, respx_mock: respx.MockRouter
+) -> None:
+    from litellm.llms.github_copilot.github_host import github_host_endpoints
+    from litellm.proxy import proxy_server
+    from litellm.proxy._types import LiteLLM_UserTable
+
+    github: Final = github_host_endpoints("octo.ghe.com")
+    headers: Final = {
+        "authorization": "Bearer private-oauth",
+        "x-github-login": "copilot-user",
+        "x-github-host": "github.com",
+        "github-copilot-host": "github.com",
+    }
+    await proxy_server.user_api_key_cache.async_set_cache(
+        key="other.ghe.com:copilot-user", value=LiteLLM_UserTable(user_id="other.ghe.com:copilot-user"),
+        model_type=LiteLLM_UserTable,
+    )
+    validation: Final = respx_mock.get(github.copilot_user_url).respond(json={"login": "copilot-user"})
+    upstream: Final = respx_mock.post(f"{github.default_copilot_api_base}/responses").respond(json={"ok": True})
+    monkeypatch.setitem(proxy_server.general_settings, "allow_requests_on_db_unavailable", True)
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=copilot_proxy), base_url="http://test") as client:
+        unprovisioned: Final = await client.post(
+            "/test-copilot/responses", json={"model": "allowed-model"}, headers=headers
+        )
+        assert unprovisioned.status_code == 503, unprovisioned.text
+        assert not upstream.called
+        await proxy_server.user_api_key_cache.async_set_cache(
+            key="octo.ghe.com:copilot-user",
+            value=LiteLLM_UserTable(user_id="octo.ghe.com:copilot-user", models=["allowed-model"]),
+            model_type=LiteLLM_UserTable,
+        )
+        denied: Final = await client.post(
+            "/test-copilot/responses", json={"model": "denied-model"}, headers=headers
+        )
+        assert denied.status_code == 403, denied.text
+        assert not upstream.called
+        allowed: Final = await client.post(
+            "/test-copilot/responses", json={"model": "allowed-model"}, headers=headers
+        )
+    assert allowed.status_code == 200, allowed.text
+    assert allowed.json() == {"ok": True}
+    assert validation.call_count == upstream.call_count == 1
 
 
 @pytest.mark.asyncio

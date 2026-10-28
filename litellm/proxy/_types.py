@@ -28,7 +28,7 @@ from typing_extensions import (
 )
 
 from litellm._uuid import uuid
-from litellm.constants import DEFAULT_STAGGER_WINDOW_SECONDS, MCP_STDIO_ALLOWED_COMMANDS
+from litellm.constants import DEFAULT_STAGGER_WINDOW_SECONDS, GITHUB_COPILOT_DEFAULT_HOST, MCP_STDIO_ALLOWED_COMMANDS
 from litellm.litellm_core_utils.initialize_dynamic_callback_params import (
     validate_arize_otlp_protocol_value,
     validate_capture_message_content_value,
@@ -2263,6 +2263,10 @@ class PassThroughGenericEndpoint(LiteLLMPydanticObjectBase):
         default=None,
         description="Endpoint-scoped authentication parser. github_copilot validates the client's GitHub OAuth bearer.",
     )
+    github_copilot_host: str = Field(
+        default=GITHUB_COPILOT_DEFAULT_HOST,
+        description="GitHub host for github_copilot authentication. Accepts github.com or a bare SUBDOMAIN.ghe.com hostname.",
+    )
     guardrails: PassThroughGuardrailsConfig | None = Field(
         default=None,
         description="Guardrails configuration for this passthrough endpoint. Dict keys are guardrail names, values are optional settings for field targeting. When set, all org/team/key level guardrails will also execute. Defaults to None (no guardrails execute).",
@@ -2275,6 +2279,13 @@ class PassThroughGenericEndpoint(LiteLLMPydanticObjectBase):
         default=None,
         description="List of HTTP methods this endpoint handles (e.g., ['GET', 'POST']). If None or empty, all methods (GET, POST, PUT, DELETE, PATCH) are supported for backward compatibility. This allows the same path to have different targets for different HTTP methods.",
     )
+
+    @field_validator("github_copilot_host")
+    @classmethod
+    def validate_github_copilot_host(cls, value: str) -> str:
+        from litellm.llms.github_copilot.github_host import github_host_endpoints
+
+        return github_host_endpoints(value).host
 
 
 class PassThroughEndpointResponse(LiteLLMPydanticObjectBase):

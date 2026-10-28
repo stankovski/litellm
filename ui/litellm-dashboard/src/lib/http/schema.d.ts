@@ -40411,6 +40411,12 @@ export interface components {
                 [key: string]: unknown;
             };
             /**
+             * Github Copilot Host
+             * @description GitHub host for github_copilot authentication. Accepts github.com or a bare SUBDOMAIN.ghe.com hostname.
+             * @default github.com
+             */
+            github_copilot_host: string;
+            /**
              * Guardrails
              * @description Guardrails configuration for this passthrough endpoint. Dict keys are guardrail names, values are optional settings for field targeting. When set, all org/team/key level guardrails will also execute. Defaults to None (no guardrails execute).
              */

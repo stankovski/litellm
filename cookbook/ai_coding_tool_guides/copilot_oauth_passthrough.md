@@ -1,6 +1,6 @@
 # Use Copilot OAuth through LiteLLM
 
-The official Copilot CLI or SDK keeps its GitHub OAuth login and sends native inference requests through LiteLLM. LiteLLM validates the bearer with `GET https://api.github.com/copilot_internal/user` and loads the provisioned LiteLLM user whose `user_id` matches the returned GitHub `login`. No separate LiteLLM key or server-side GitHub login is needed for these inference requests
+The official Copilot CLI or SDK keeps its GitHub OAuth login and sends native inference requests through LiteLLM. By default, LiteLLM validates the bearer with `GET https://api.github.com/copilot_internal/user` and loads the provisioned LiteLLM user whose `user_id` matches the returned GitHub `login`. GHE.com configuration and host-qualified user IDs are described below. No separate LiteLLM key or server-side GitHub login is needed for these inference requests
 
 This requires a client build containing managed inference routing from [github/copilot-agent-runtime#24482](https://github.com/github/copilot-agent-runtime/pull/24482). Do not assume an older released CLI supports it. Authentication, model discovery, and session-token requests stay on the client's normal Copilot endpoints
 
@@ -46,6 +46,37 @@ curl --fail-with-body http://localhost:4000/user/new \
 
 Set model permissions, budgets, and rate limits on that user through the usual management surfaces. Model permissions use the native Copilot model IDs, without LiteLLM model aliases. Provisioning is required even if GitHub accepts the token. The OAuth credential never inherits a provisioned user's administrative role
 
+## GitHub Enterprise Cloud with data residency
+
+For GHE.com, set `github_copilot_host` to the bare hostname on each endpoint and change its inference target to the matching GHE.com Copilot API. For example
+
+```yaml
+- path: /copilot/responses
+  target: https://copilot-api.SUBDOMAIN.ghe.com/responses
+  methods: [POST]
+  auth: true
+  custom_auth_parser: github_copilot
+  github_copilot_host: SUBDOMAIN.ghe.com
+  forward_headers: true
+```
+
+Apply the same host to the Chat Completions and Messages endpoints, using targets `https://copilot-api.SUBDOMAIN.ghe.com/chat/completions` and `https://copilot-api.SUBDOMAIN.ghe.com/v1/messages`
+
+LiteLLM validates the client's bearer at `https://api.SUBDOMAIN.ghe.com/copilot_internal/user`. Do not use `https://SUBDOMAIN.ghe.com/api` as the API base. Only `github.com` and single-subdomain `SUBDOMAIN.ghe.com` hostnames are accepted, without a scheme, port, or path. GitHub Enterprise Server hosts are not supported. Omitting `github_copilot_host` uses `github.com`, and hostnames are normalized to lowercase
+
+Provision GHE.com users with `user_id` set to `subdomain.ghe.com:GITHUB_LOGIN`, using the normalized host and the exact returned login. For example
+
+```bash
+curl --fail-with-body http://localhost:4000/user/new \
+  -H "Authorization: Bearer $LITELLM_MASTER_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"user_id":"subdomain.ghe.com:GITHUB_LOGIN","user_role":"internal_user","auto_create_key":false}'
+```
+
+This keeps user policy, budgets, rate limits, and logging separate when the same login exists on different hosts. GitHub.com users retain their existing plain-login user IDs. Identity validation caches are also host-scoped. The host is selected only from the endpoint's server configuration, never from caller headers, and rejected enterprise credentials do not fall back to github.com
+
+Keep the client's normal GHE.com login and control-plane configuration. `copilotInferenceUrl` still points at LiteLLM. This pass-through configuration does not start a server-side device flow or use the separate `github_copilot` provider's stored credentials
+
 ## Configure the client
 
 Set the following managed runtime setting using the configuration mechanism supported by your compatible client build
@@ -62,7 +93,7 @@ HTTP and SSE are supported. Native WebSocket forwarding is not included. The com
 
 ## Authentication and policy behavior
 
-Successful token-to-login validation is cached locally for five minutes under a SHA-256 token identifier. Failures are not cached, and expired validation never falls back to a stale identity. GitHub-side revocation can therefore take up to five minutes to be recognized. LiteLLM resolves provisioning and policy separately on each request through its existing user cache and database lookup behavior
+Successful token-to-login validation is cached locally for five minutes under the normalized GitHub host and a SHA-256 token identifier. Failures are not cached, and expired validation never falls back to a stale identity. GitHub-side revocation can therefore take up to five minutes to be recognized. LiteLLM resolves provisioning and policy separately on each request through its existing user cache and database lookup behavior
 
 The proxy returns 401 for a missing, malformed, or rejected bearer and 403 for a validated login without a provisioned user. Invalid GitHub responses return 502. Validation outages, timeouts, rate limiting, or unavailable user policy return 503. These failures never fall back to a virtual key, shared provider account, or anonymous database-outage identity
 
@@ -70,4 +101,4 @@ Normal LiteLLM authentication is unchanged outside the opted-in endpoints. Maste
 
 Check a completed request in LiteLLM's Logs page for the validated user ID. Authentication and logging use a hashed credential identifier, while credential-header copies redact both the OAuth bearer and Copilot session token. Native inference bodies, SSE streams, and upstream error responses retain the existing pass-through behavior
 
-This integration does not add Copilot-specific billing. Existing user policy checks apply, but generic pass-through does not guarantee accurate Copilot dollar-cost accounting from native billing metadata. It also does not add a model catalog, an OAuth acquisition flow, or enterprise host discovery
+This integration does not add Copilot-specific billing. Existing user policy checks apply, but generic pass-through does not guarantee accurate Copilot dollar-cost accounting from native billing metadata. It also does not add a model catalog, an OAuth acquisition flow, or automatic enterprise host discovery

@@ -1,5 +1,6 @@
 from typing import Final
 
+import httpx
 import pytest
 
 from litellm.llms.github_copilot.github_host import (
@@ -57,3 +58,13 @@ def test_ghe_endpoints_ignore_github_com_url_overrides(monkeypatch: pytest.Monke
     assert endpoints.user_url == "https://api.octo.ghe.com/user"
     assert endpoints.default_copilot_api_base == "https://copilot-api.octo.ghe.com"
     assert endpoints.client_id == "custom-client"
+
+
+@pytest.mark.parametrize("host", ["github.com", "OCTO.ghe.com"])
+def test_copilot_identity_uses_the_hosts_api_origin_not_token_exchange_overrides(
+    monkeypatch: pytest.MonkeyPatch, host: str
+) -> None:
+    monkeypatch.setenv("GITHUB_COPILOT_API_KEY_URL", "https://untrusted.example/token")
+    endpoints: Final = github_host_endpoints(host)
+
+    assert httpx.URL(endpoints.copilot_user_url) == httpx.URL(endpoints.user_url).copy_with(path="/copilot_internal/user")

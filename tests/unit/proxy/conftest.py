@@ -15,6 +15,7 @@ import yaml
 from fastapi.testclient import TestClient
 from fastapi import FastAPI
 from prisma.errors import ClientNotConnectedError
+from pydantic import TypeAdapter
 
 import litellm
 import litellm.proxy.proxy_server
@@ -26,7 +27,10 @@ from tests._master_key import MASTER_KEY
 
 
 @pytest.fixture
-async def copilot_proxy(monkeypatch: pytest.MonkeyPatch, httpx_transport: None) -> AsyncIterator[FastAPI]:
+async def copilot_proxy(
+    monkeypatch: pytest.MonkeyPatch, httpx_transport: None, request: pytest.FixtureRequest
+) -> AsyncIterator[FastAPI]:
+    from litellm.llms.github_copilot.github_host import github_host_endpoints
     from litellm.proxy import proxy_server
     from litellm.proxy._types import LiteLLMRoutes, LiteLLM_UserTable
     from litellm.proxy.common_utils.user_api_key_cache import UserApiKeyCache
@@ -34,13 +38,16 @@ async def copilot_proxy(monkeypatch: pytest.MonkeyPatch, httpx_transport: None) 
 
     app: Final = FastAPI(exception_handlers=dict(proxy_server.app.exception_handlers))
     cache: Final = UserApiKeyCache()
+    host: Final = TypeAdapter(str).validate_python(getattr(request, "param", "github.com"))
+    github: Final = github_host_endpoints(host)
     endpoints: Final = [
         {
             "path": f"/test-copilot/{suffix}",
-            "target": f"https://api.githubcopilot.com/{suffix}",
+            "target": f"{github.default_copilot_api_base}/{suffix}",
             "methods": ["POST"],
             "auth": True,
             "custom_auth_parser": "github_copilot",
+            "github_copilot_host": host,
             "forward_headers": True,
         }
         for suffix in ("chat/completions", "v1/messages", "responses")

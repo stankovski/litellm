@@ -4,8 +4,11 @@ import httpx
 import pytest
 import respx
 from fastapi import Request
+from pydantic import ValidationError
 
 from litellm.caching.in_memory_cache import InMemoryCache
+from litellm.llms.github_copilot.github_host import github_host_endpoints
+from litellm.proxy._types import PassThroughGenericEndpoint
 from litellm.proxy.auth.github_copilot_auth import (
     CopilotAuthFailure,
     CopilotIdentity,
@@ -25,7 +28,10 @@ class _Clock:
 
 
 @pytest.mark.asyncio
-async def test_copilot_validation_forwards_only_identity_headers(respx_mock: respx.MockRouter) -> None:
+@pytest.mark.parametrize("github_host", ["github.com", "octo.ghe.com"])
+async def test_copilot_validation_forwards_only_identity_headers(
+    respx_mock: respx.MockRouter, github_host: str
+) -> None:
     headers: Final = {
         "authorization": "Bearer client-oauth",
         "copilot-integration-id": "copilot-cli",
@@ -36,11 +42,16 @@ async def test_copilot_validation_forwards_only_identity_headers(respx_mock: res
         "copilot-session-token": "private-session",
         "x-litellm-api-key": "private-gateway-key",
         "x-github-login": "forged-user",
+        "x-github-host": "untrusted.example",
         "x-copilot-inference-gateway": "true",
     }
-    upstream: Final = respx_mock.get(_VALIDATION_URL).respond(json={"login": "  verified-user  ", "ignored": True})
+    upstream: Final = respx_mock.get(github_host_endpoints(github_host).copilot_user_url).respond(
+        json={"login": "  verified-user  ", "ignored": True}
+    )
     async with httpx.AsyncClient() as client:
-        result: Final = await resolve_copilot_identity(headers, client=client, cache=UserApiKeyCache())
+        result: Final = await resolve_copilot_identity(
+            headers, client=client, cache=UserApiKeyCache(), github_host=github_host
+        )
     assert result == CopilotIdentity(login="verified-user")
     sent: Final = upstream.calls.last.request
     for name in (
@@ -49,7 +60,7 @@ async def test_copilot_validation_forwards_only_identity_headers(respx_mock: res
     ):
         assert sent.headers[name] == headers[name]
     assert sent.headers.keys().isdisjoint(
-        {"copilot-session-token", "x-litellm-api-key", "x-github-login", "x-copilot-inference-gateway"}
+        {"copilot-session-token", "x-litellm-api-key", "x-github-login", "x-github-host", "x-copilot-inference-gateway"}
     )
     assert sent.extensions["timeout"] == {"connect": 5.0, "read": 5.0, "write": 5.0, "pool": 5.0}
 
@@ -78,6 +89,66 @@ async def test_copilot_cache_expires_without_accepting_stale_identity(respx_mock
 
 
 @pytest.mark.asyncio
+async def test_copilot_identity_cache_is_isolated_by_normalized_host(respx_mock: respx.MockRouter) -> None:
+    headers: Final = {"authorization": "Bearer shared-oauth"}
+    cache: Final = UserApiKeyCache()
+    github: Final = respx_mock.get(github_host_endpoints("github.com").copilot_user_url).respond(
+        json={"login": "github-user"}
+    )
+    enterprise: Final = respx_mock.get(github_host_endpoints("octo.ghe.com").copilot_user_url).respond(401)
+    other_enterprise: Final = respx_mock.get(github_host_endpoints("other.ghe.com").copilot_user_url).respond(401)
+    async with httpx.AsyncClient() as client:
+        public_identity: Final = await resolve_copilot_identity(headers, client=client, cache=cache)
+        rejected: Final = await resolve_copilot_identity(
+            headers, client=client, cache=cache, github_host="octo.ghe.com"
+        )
+        assert isinstance(rejected, CopilotAuthFailure)
+        assert rejected.status_code == 401
+        enterprise.respond(json={"login": "enterprise-user"})
+        enterprise_identity: Final = await resolve_copilot_identity(
+            headers, client=client, cache=cache, github_host="OCTO.ghe.com"
+        )
+        cached_enterprise: Final = await resolve_copilot_identity(
+            headers, client=client, cache=cache, github_host="octo.ghe.com"
+        )
+        cached_public: Final = await resolve_copilot_identity(headers, client=client, cache=cache)
+        rejected_other: Final = await resolve_copilot_identity(
+            headers, client=client, cache=cache, github_host="other.ghe.com"
+        )
+    assert public_identity == cached_public == CopilotIdentity(login="github-user")
+    assert enterprise_identity == cached_enterprise == CopilotIdentity(login="enterprise-user")
+    assert isinstance(rejected_other, CopilotAuthFailure)
+    assert rejected_other.status_code == 401
+    assert github.call_count == other_enterprise.call_count == 1
+    assert enterprise.call_count == 2
+    assert enterprise.calls.last.request.headers["authorization"] == headers["authorization"]
+
+
+@pytest.mark.parametrize(
+    "host",
+    [
+        "https://octo.ghe.com/api",
+        "octo.ghe.com:443",
+        "api.octo.ghe.com",
+        "ghes.example.com",
+        "octo.ghe.com.evil.example",
+        "127.0.0.1",
+        None,
+    ],
+)
+def test_copilot_configuration_rejects_unsupported_validation_hosts(host: object) -> None:
+    with pytest.raises(ValidationError, match="github_copilot_host"):
+        PassThroughGenericEndpoint.model_validate({
+            "path": "/inference/responses",
+            "target": "https://api.githubcopilot.com/responses",
+            "auth": True,
+            "custom_auth_parser": "github_copilot",
+            "github_copilot_host": host,
+        })
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("github_host", ["github.com", "octo.ghe.com"])
 @pytest.mark.parametrize(
     "status,body,expected",
     [
@@ -94,33 +165,45 @@ async def test_copilot_cache_expires_without_accepting_stale_identity(respx_mock
     ],
 )
 async def test_copilot_invalid_validation_is_sanitized_and_never_cached(
-    respx_mock: respx.MockRouter, status: int, body: bytes, expected: int
+    respx_mock: respx.MockRouter, status: int, body: bytes, expected: int, github_host: str
 ) -> None:
-    upstream: Final = respx_mock.get(_VALIDATION_URL).respond(
+    validation_url: Final = github_host_endpoints(github_host).copilot_user_url
+    upstream: Final = respx_mock.get(validation_url).respond(
         status, content=body, headers={"location": "https://untrusted.example/collect"}
     )
     cache: Final = UserApiKeyCache()
     async with httpx.AsyncClient(follow_redirects=True) as client:
-        first: Final = await resolve_copilot_identity({"authorization": "Bearer private-oauth"}, client=client, cache=cache)
-        second: Final = await resolve_copilot_identity({"authorization": "Bearer private-oauth"}, client=client, cache=cache)
+        first: Final = await resolve_copilot_identity(
+            {"authorization": "Bearer private-oauth"}, client=client, cache=cache, github_host=github_host
+        )
+        second: Final = await resolve_copilot_identity(
+            {"authorization": "Bearer private-oauth"}, client=client, cache=cache, github_host=github_host
+        )
     assert isinstance(first, CopilotAuthFailure)
     assert first.status_code == expected
     assert first == second
     assert upstream.call_count == 2
     assert "private" not in repr(first)
-    assert all(call.request.url == _VALIDATION_URL for call in respx_mock.calls)
+    assert all(call.request.url == validation_url for call in respx_mock.calls)
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("github_host", ["github.com", "octo.ghe.com"])
 @pytest.mark.parametrize("error", [httpx.ReadTimeout, httpx.ConnectError])
 async def test_copilot_transport_failures_are_retryable(
-    respx_mock: respx.MockRouter, error: type[httpx.RequestError]
+    respx_mock: respx.MockRouter, error: type[httpx.RequestError], github_host: str
 ) -> None:
-    upstream: Final = respx_mock.get(_VALIDATION_URL).mock(side_effect=error("private transport details"))
+    upstream: Final = respx_mock.get(github_host_endpoints(github_host).copilot_user_url).mock(
+        side_effect=error("private transport details")
+    )
     cache: Final = UserApiKeyCache()
     async with httpx.AsyncClient() as client:
-        first: Final = await resolve_copilot_identity({"authorization": "Bearer private-oauth"}, client=client, cache=cache)
-        second: Final = await resolve_copilot_identity({"authorization": "Bearer private-oauth"}, client=client, cache=cache)
+        first: Final = await resolve_copilot_identity(
+            {"authorization": "Bearer private-oauth"}, client=client, cache=cache, github_host=github_host
+        )
+        second: Final = await resolve_copilot_identity(
+            {"authorization": "Bearer private-oauth"}, client=client, cache=cache, github_host=github_host
+        )
     assert isinstance(first, CopilotAuthFailure)
     assert first.status_code == 503
     assert first == second

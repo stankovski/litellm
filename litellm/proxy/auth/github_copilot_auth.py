@@ -8,6 +8,8 @@ from fastapi import HTTPException, Request
 from pydantic import BaseModel, ConfigDict, StringConstraints, TypeAdapter, ValidationError
 from typing_extensions import assert_never
 
+from litellm.constants import GITHUB_COPILOT_DEFAULT_HOST
+from litellm.llms.github_copilot.github_host import github_host_endpoints
 from litellm.proxy._types import LitellmUserRoles, PassThroughGenericEndpoint, UserAPIKeyAuth
 from litellm.proxy.auth.resolvers.grants import (
     GrantResolver,
@@ -22,7 +24,6 @@ from litellm.proxy.common_utils.user_api_key_cache import UserApiKeyCache
 from litellm.proxy.spend_tracking.carried_budget_state import carry_team_and_user_budget_state
 from litellm.types.proxy.auth.user_api_key_auth import hash_token
 
-_VALIDATION_URL: Final = "https://api.github.com/copilot_internal/user"
 _VALIDATION_HEADERS: Final = frozenset(
     {"copilot-integration-id", "editor-version", "editor-plugin-version", "copilot-api-version", "user-agent"}
 )
@@ -85,19 +86,24 @@ def _bearer(headers: Mapping[str, str]) -> str | CopilotAuthFailure:
 
 
 async def resolve_copilot_identity(
-    headers: Mapping[str, str], *, client: httpx.AsyncClient, cache: UserApiKeyCache
+    headers: Mapping[str, str],
+    *,
+    client: httpx.AsyncClient,
+    cache: UserApiKeyCache,
+    github_host: str = GITHUB_COPILOT_DEFAULT_HOST,
 ) -> CopilotIdentity | CopilotAuthFailure:
     token: Final = _bearer(headers)
     if isinstance(token, CopilotAuthFailure):
         return token
-    cache_key: Final = copilot_credential_id(f"Bearer {token}")
+    endpoints: Final = github_host_endpoints(github_host)
+    cache_key: Final = f"{endpoints.host}:{copilot_credential_id(f'Bearer {token}')}"
     cached: Final = await cache.async_get_cache(key=cache_key, model_type=CopilotIdentity, local_only=True)
     if cached is not None:
         return cached
     forwarded: Final = {name: value for name, value in headers.items() if name.lower() in _VALIDATION_HEADERS}
     try:
         response: Final = await client.get(
-            _VALIDATION_URL,
+            endpoints.copilot_user_url,
             headers={**forwarded, "Authorization": f"Bearer {token}"},
             timeout=5.0,
             follow_redirects=False,
@@ -130,10 +136,17 @@ async def authenticate_copilot_request(
         return CopilotAuthFailure(500, "Copilot authentication requires an authenticated, exact pass-through route")
     if len(request.headers.getlist("authorization")) != 1:
         return CopilotAuthFailure(401, "Exactly one GitHub OAuth bearer token is required")
-    identity: Final = await resolve_copilot_identity(request.headers, client=client, cache=cache)
+    identity: Final = await resolve_copilot_identity(
+        request.headers, client=client, cache=cache, github_host=endpoint.github_copilot_host
+    )
     if isinstance(identity, CopilotAuthFailure):
         return identity
-    resolved: Final = await grants.resolve(UserLookup(user_id=identity.login), team_id=None)
+    user_id: Final = (
+        identity.login
+        if endpoint.github_copilot_host == GITHUB_COPILOT_DEFAULT_HOST
+        else f"{endpoint.github_copilot_host}:{identity.login}"
+    )
+    resolved: Final = await grants.resolve(UserLookup(user_id=user_id), team_id=None)
     match resolved:
         case UserGone():
             return CopilotAuthFailure(403, "The GitHub user is not provisioned in LiteLLM")
@@ -148,7 +161,7 @@ async def authenticate_copilot_request(
                 return CopilotAuthFailure(503, "The LiteLLM user policy is temporarily unavailable")
             auth: Final = UserAPIKeyAuth(
                 api_key=copilot_credential_id(request.headers["authorization"]),
-                user_id=identity.login,
+                user_id=user_id,
                 user_role=LitellmUserRoles.INTERNAL_USER,
                 models=list(policy.models),
                 allowed_routes=[endpoint.path],
