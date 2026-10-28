@@ -86,6 +86,309 @@ PROTOCOL_CONSTRAINED_PASS_THROUGH_ROUTES: Final = MappingProxyType(
 )
 
 
+class _CopilotObservations(CustomLogger):
+    def __init__(self) -> None:
+        super().__init__()
+        self.successes: Final[asyncio.Queue[dict[str, object]]] = asyncio.Queue()
+        self.failures: Final[asyncio.Queue[dict[str, object]]] = asyncio.Queue()
+
+    async def async_log_success_event(
+        self, kwargs: dict[str, object], response_obj: object, start_time: datetime, end_time: datetime
+    ) -> None:
+        await self.successes.put(kwargs)
+
+    async def async_post_call_failure_hook(
+        self, request_data: dict[str, object], original_exception: Exception,
+        user_api_key_dict: UserAPIKeyAuth, traceback_str: str | None = None,
+    ) -> None:
+        await self.failures.put({
+            "request": request_data, "error": str(original_exception), "auth": user_api_key_dict.model_dump(),
+        })
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("suffix", ["chat/completions", "v1/messages", "responses"])
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize(
+    ("copilot_proxy", "github_host", "user_id"),
+    [("github.com", "github.com", "copilot-user"), ("OCTO.ghe.com", "octo.ghe.com", "octo.ghe.com:copilot-user")],
+    indirect=["copilot_proxy"],
+)
+async def test_copilot_native_inference_preserves_credentials_body_and_stream_without_logging_secrets(
+    copilot_proxy: FastAPI, monkeypatch: pytest.MonkeyPatch, respx_mock: respx.MockRouter, suffix: str, stream: bool,
+    github_host: str, user_id: str,
+) -> None:
+    from litellm.llms.github_copilot.github_host import github_host_endpoints
+    from litellm.proxy import proxy_server
+    from litellm.proxy._types import LiteLLM_UserTable
+
+    github: Final = github_host_endpoints(github_host)
+    await proxy_server.user_api_key_cache.async_set_cache(
+        key=user_id, value=LiteLLM_UserTable(user_id=user_id), model_type=LiteLLM_UserTable
+    )
+    recorder: Final = _CopilotObservations()
+    monkeypatch.setattr(litellm, "_async_success_callback", [recorder])
+    validation: Final = respx_mock.get(github.copilot_user_url).respond(
+        json={"login": "copilot-user"}
+    )
+    body: Final = {
+        "model": "native-test-model", "stream": stream,
+        "messages": [{"role": "user", "content": "Hello"}], "native_option": {"preserved": True},
+    }
+    message: Final = {
+        "id": "test-message", "type": "message", "role": "assistant", "model": body["model"],
+        "content": [{"type": "text", "text": "Hello"}], "stop_reason": "end_turn", "stop_sequence": None,
+        "usage": {"input_tokens": 2, "output_tokens": 1},
+    }
+    content: Final = b'event: delta\ndata: {"text":"Hello"}\n\n' if stream else json.dumps(message).encode()
+    upstream: Final = respx_mock.post(f"{github.default_copilot_api_base}/{suffix}").respond(
+        content=content, headers={"content-type": "text/event-stream" if stream else "application/json"}
+    )
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=copilot_proxy), base_url="http://test") as client:
+        response: Final = await client.post(
+            f"/test-copilot/{suffix}", json=body,
+            headers={
+                "authorization": "Bearer private-oauth", "copilot-session-token": "private-session",
+                "copilot-integration-id": "test-integration", "editor-version": "test-editor",
+                "x-github-login": "forged-user", "x-copilot-inference-gateway": "true",
+            },
+        )
+        assert response.status_code == 200, response.text
+        logged: Final = await asyncio.wait_for(recorder.successes.get(), timeout=5)
+    assert response.content == content
+    assert json.loads(upstream.calls.last.request.content) == body
+    assert upstream.calls.last.request.headers["authorization"] == "Bearer private-oauth"
+    assert upstream.calls.last.request.headers["copilot-session-token"] == "private-session"
+    assert upstream.calls.last.request.headers["copilot-integration-id"] == "test-integration"
+    assert validation.call_count == 1
+    serialized: Final = json.dumps(logged, default=str)
+    assert user_id in serialized
+    assert "private-oauth" not in serialized
+    assert "private-session" not in serialized
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("copilot_proxy", ["OCTO.ghe.com"], indirect=True)
+async def test_copilot_ghe_cannot_inherit_another_hosts_user_policy(
+    copilot_proxy: FastAPI, monkeypatch: pytest.MonkeyPatch, respx_mock: respx.MockRouter
+) -> None:
+    from litellm.llms.github_copilot.github_host import github_host_endpoints
+    from litellm.proxy import proxy_server
+    from litellm.proxy._types import LiteLLM_UserTable
+
+    github: Final = github_host_endpoints("octo.ghe.com")
+    headers: Final = {
+        "authorization": "Bearer private-oauth",
+        "x-github-login": "copilot-user",
+        "x-github-host": "github.com",
+        "github-copilot-host": "github.com",
+    }
+    await proxy_server.user_api_key_cache.async_set_cache(
+        key="other.ghe.com:copilot-user", value=LiteLLM_UserTable(user_id="other.ghe.com:copilot-user"),
+        model_type=LiteLLM_UserTable,
+    )
+    validation: Final = respx_mock.get(github.copilot_user_url).respond(json={"login": "copilot-user"})
+    upstream: Final = respx_mock.post(f"{github.default_copilot_api_base}/responses").respond(json={"ok": True})
+    monkeypatch.setitem(proxy_server.general_settings, "allow_requests_on_db_unavailable", True)
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=copilot_proxy), base_url="http://test") as client:
+        unprovisioned: Final = await client.post(
+            "/test-copilot/responses", json={"model": "allowed-model"}, headers=headers
+        )
+        assert unprovisioned.status_code == 503, unprovisioned.text
+        assert not upstream.called
+        await proxy_server.user_api_key_cache.async_set_cache(
+            key="octo.ghe.com:copilot-user",
+            value=LiteLLM_UserTable(user_id="octo.ghe.com:copilot-user", models=["allowed-model"]),
+            model_type=LiteLLM_UserTable,
+        )
+        denied: Final = await client.post(
+            "/test-copilot/responses", json={"model": "denied-model"}, headers=headers
+        )
+        assert denied.status_code == 403, denied.text
+        assert not upstream.called
+        allowed: Final = await client.post(
+            "/test-copilot/responses", json={"model": "allowed-model"}, headers=headers
+        )
+    assert allowed.status_code == 200, allowed.text
+    assert allowed.json() == {"ok": True}
+    assert validation.call_count == upstream.call_count == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ["normal", "no-master-key", "custom-auth", "jwt", "oauth"])
+async def test_copilot_user_model_policy_cannot_be_skipped(
+    copilot_proxy: FastAPI, monkeypatch: pytest.MonkeyPatch, respx_mock: respx.MockRouter, mode: str
+) -> None:
+    from litellm.proxy import proxy_server
+    from litellm.proxy._types import LiteLLM_UserTable, LitellmUserRoles
+
+    async def custom_auth(request: Request, api_key: str) -> UserAPIKeyAuth:
+        return UserAPIKeyAuth(user_role=LitellmUserRoles.PROXY_ADMIN)
+
+    if mode == "no-master-key":
+        monkeypatch.setattr(proxy_server, "master_key", None)
+    if mode == "custom-auth":
+        monkeypatch.setattr(proxy_server, "user_custom_auth", custom_auth)
+    if mode in ("jwt", "oauth"):
+        monkeypatch.setitem(proxy_server.general_settings, "enable_jwt_auth" if mode == "jwt" else "enable_oauth2_auth", True)
+    await proxy_server.user_api_key_cache.async_set_cache(
+        key="copilot-user", value=LiteLLM_UserTable(user_id="copilot-user", models=["allowed-model"]),
+        model_type=LiteLLM_UserTable,
+    )
+    respx_mock.get("https://api.github.com/copilot_internal/user").respond(json={"login": "copilot-user"})
+    upstream: Final = respx_mock.post("https://api.githubcopilot.com/responses").respond(json={"ok": True})
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=copilot_proxy), base_url="http://test") as client:
+        response: Final = await client.post(
+            "/test-copilot/responses", json={"model": "denied-model"}, headers={"authorization": "Bearer client-oauth"}
+        )
+    assert response.status_code == 403, response.text
+    assert not upstream.called
+
+
+@pytest.mark.asyncio
+async def test_copilot_identity_cache_does_not_cache_user_policy(
+    copilot_proxy: FastAPI, respx_mock: respx.MockRouter
+) -> None:
+    from litellm.proxy import proxy_server
+    from litellm.proxy._types import LiteLLM_UserTable
+
+    validation: Final = respx_mock.get("https://api.github.com/copilot_internal/user").respond(
+        json={"login": "copilot-user"}
+    )
+    upstream: Final = respx_mock.post("https://api.githubcopilot.com/responses").respond(json={"ok": True})
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=copilot_proxy), base_url="http://test") as client:
+        first: Final = await client.post(
+            "/test-copilot/responses", json={"model": "native-test-model"}, headers={"authorization": "Bearer client-oauth"}
+        )
+        assert first.status_code == 200, first.text
+        await proxy_server.user_api_key_cache.async_set_cache(
+            key="copilot-user", value=LiteLLM_UserTable(user_id="copilot-user", models=["different-model"]),
+            model_type=LiteLLM_UserTable,
+        )
+        second: Final = await client.post(
+            "/test-copilot/responses", json={"model": "native-test-model"}, headers={"authorization": "Bearer client-oauth"}
+        )
+    assert second.status_code == 403, second.text
+    assert validation.call_count == 1
+    assert upstream.call_count == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("validation_status,expected", [(401, 401), (503, 503), (200, 503)])
+async def test_copilot_auth_failures_never_fall_back_or_expose_credentials(
+    copilot_proxy: FastAPI, monkeypatch: pytest.MonkeyPatch, respx_mock: respx.MockRouter,
+    caplog: pytest.LogCaptureFixture, validation_status: int, expected: int,
+) -> None:
+    from litellm.proxy import proxy_server
+
+    recorder: Final = _CopilotObservations()
+    monkeypatch.setattr(litellm, "callbacks", [recorder])
+    monkeypatch.setitem(proxy_server.general_settings, "allow_requests_on_db_unavailable", True)
+    respx_mock.get("https://api.github.com/copilot_internal/user").respond(
+        validation_status, json={"login": "unprovisioned-user", "private": "private-upstream-body"}
+    )
+    upstream: Final = respx_mock.post("https://api.githubcopilot.com/responses").respond(json={"ok": True})
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=copilot_proxy), base_url="http://test") as client:
+        response: Final = await client.post(
+            "/test-copilot/responses", json={"model": "native-test-model"},
+            headers={
+                "authorization": "Bearer private-oauth", "copilot-session-token": "private-session",
+                "x-litellm-api-key": MASTER_KEY, "x-github-login": "copilot-user",
+                "x-copilot-inference-gateway": "true",
+            },
+        )
+        assert response.status_code == expected, response.text
+        failure: Final = await asyncio.wait_for(recorder.failures.get(), timeout=5)
+    serialized: Final = json.dumps(failure, default=str) + response.text + caplog.text
+    for secret in ("private-oauth", "private-session", "private-upstream-body"):
+        assert secret not in serialized
+    assert not upstream.called
+
+
+@pytest.mark.asyncio
+async def test_copilot_unprovisioned_user_is_forbidden_without_creating_a_user(
+    copilot_proxy: FastAPI, monkeypatch: pytest.MonkeyPatch, respx_mock: respx.MockRouter
+) -> None:
+    from prisma import Prisma
+
+    from litellm.proxy import proxy_server
+    from litellm.proxy.utils import PrismaClient
+
+    sdk: Final = MagicMock(spec=Prisma)
+    sdk.litellm_usertable.find_unique = AsyncMock(return_value=None)
+    sdk.litellm_usertable.create = AsyncMock()
+    with patch("prisma.Prisma", return_value=sdk):
+        database: Final = PrismaClient(
+            database_url="postgresql://test:test@localhost:5432/test", proxy_logging_obj=proxy_server.proxy_logging_obj
+        )
+    monkeypatch.setattr(proxy_server, "prisma_client", database)
+    respx_mock.get("https://api.github.com/copilot_internal/user").respond(json={"login": "unprovisioned-user"})
+    upstream: Final = respx_mock.post("https://api.githubcopilot.com/responses").respond(json={"ok": True})
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=copilot_proxy), base_url="http://test") as client:
+        response: Final = await client.post(
+            "/test-copilot/responses", json={"model": "native-test-model"}, headers={"authorization": "Bearer client-oauth"}
+        )
+    assert response.status_code == 403, response.text
+    assert not upstream.called
+    sdk.litellm_usertable.create.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_copilot_user_budget_is_enforced_before_forwarding(
+    copilot_proxy: FastAPI, respx_mock: respx.MockRouter
+) -> None:
+    from litellm.proxy import proxy_server
+    from litellm.proxy._types import LiteLLM_UserTable
+
+    budget: Final = 1.0
+    await proxy_server.user_api_key_cache.async_set_cache(
+        key="copilot-user", value=LiteLLM_UserTable(user_id="copilot-user", max_budget=budget, spend=budget),
+        model_type=LiteLLM_UserTable,
+    )
+    respx_mock.get("https://api.github.com/copilot_internal/user").respond(json={"login": "copilot-user"})
+    upstream: Final = respx_mock.post("https://api.githubcopilot.com/responses").respond(json={"ok": True})
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=copilot_proxy), base_url="http://test") as client:
+        response: Final = await client.post(
+            "/test-copilot/responses", json={"model": "native-test-model"}, headers={"authorization": "Bearer client-oauth"}
+        )
+    assert response.status_code == 422, response.text
+    assert response.json()["error"]["type"] == "budget_exceeded"
+    assert not upstream.called
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("auth", [False, None])
+async def test_copilot_parser_cannot_make_an_endpoint_unauthenticated(
+    copilot_proxy: FastAPI, monkeypatch: pytest.MonkeyPatch, respx_mock: respx.MockRouter, auth: bool | None
+) -> None:
+    from litellm.proxy import proxy_server
+
+    endpoints: Final = [{
+        "path": "/test-copilot/responses", "target": "https://api.githubcopilot.com/responses",
+        "custom_auth_parser": "github_copilot", **({"auth": auth} if auth is not None else {}),
+    }]
+    monkeypatch.setitem(proxy_server.general_settings, "pass_through_endpoints", endpoints)
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=copilot_proxy), base_url="http://test") as client:
+        response: Final = await client.post(
+            "/test-copilot/responses", json={"model": "native-test-model"}, headers={"authorization": "Bearer client-oauth"}
+        )
+    assert response.status_code == 500, response.text
+    assert not respx_mock.calls
+
+
+@pytest.mark.asyncio
+async def test_copilot_duplicate_authorization_cannot_validate_and_forward_different_users(
+    copilot_proxy: FastAPI, respx_mock: respx.MockRouter
+) -> None:
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=copilot_proxy), base_url="http://test") as client:
+        response: Final = await client.post(
+            "/test-copilot/responses", json={"model": "native-test-model"},
+            headers=[("authorization", "Bearer first-user"), ("authorization", "Bearer second-user")],
+        )
+    assert response.status_code == 401, response.text
+    assert not respx_mock.calls
+
+
 def test_with_trace_context_without_opentelemetry(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setitem(sys.modules, "litellm.integrations.otel.plumbing.context", None)
 

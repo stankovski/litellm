@@ -18,6 +18,7 @@ from unittest.mock import ANY, AsyncMock, MagicMock, patch
 
 
 import orjson
+import respx
 import pytest
 from fastapi import HTTPException, Request, status
 from starlette.datastructures import UploadFile
@@ -87,6 +88,67 @@ from litellm.proxy.auth.user_api_key_auth import (
 from litellm.proxy.spend_tracking.carried_budget_state import carried_budget_metadata
 from tests.unit.proxy.db.fake_prisma_engine import engine_call
 from tests._master_key import MASTER_KEY
+
+
+@pytest.mark.asyncio
+async def test_copilot_bearer_identity_cannot_promote_a_provisioned_admin(
+    copilot_proxy: object, respx_mock: respx.MockRouter
+) -> None:
+    await litellm.proxy.proxy_server.user_api_key_cache.async_set_cache(
+        key="copilot-user",
+        value=LiteLLM_UserTable(
+            user_id="copilot-user", user_role=LitellmUserRoles.PROXY_ADMIN, models=["native-model"]
+        ),
+        model_type=LiteLLM_UserTable,
+    )
+    upstream: Final = respx_mock.get("https://api.github.com/copilot_internal/user").respond(
+        json={"login": "copilot-user"}
+    )
+    request: Final = Request({
+        "type": "http", "method": "POST", "path": "/test-copilot/responses",
+        "endpoint": next(
+            route.endpoint for route in litellm.proxy.proxy_server.app.routes
+            if getattr(route, "path", "") == "/test-copilot/responses"
+        ),
+        "headers": [
+            (b"authorization", b"Bearer client-oauth"),
+            (b"x-litellm-api-key", MASTER_KEY.encode()),
+            (b"x-github-login", b"forged-user"),
+            (b"x-copilot-inference-gateway", b"true"),
+        ],
+    })
+    auth: Final = await user_api_key_auth_builder(
+        request=request, api_key="Bearer untrusted-argument", azure_api_key_header="",
+        anthropic_api_key_header=None, google_ai_studio_api_key_header=None, azure_apim_header=None,
+        custom_litellm_key_header=MASTER_KEY, request_data={"model": "native-model", "user": "forged-user"},
+    )
+    assert auth.user_id == "copilot-user"
+    assert auth.user_role == LitellmUserRoles.INTERNAL_USER
+    assert auth.models == ["native-model"]
+    assert auth.allowed_routes == ["/test-copilot/responses"]
+    assert auth.metadata["allowed_passthrough_routes"] == ["/test-copilot/responses"]
+    assert not auth.via_virtual_key
+    assert auth.api_key is not None and auth.api_key.startswith("copilot-sha256:")
+    assert "client-oauth" not in auth.model_dump_json()
+    assert "untrusted-argument" not in auth.model_dump_json()
+    assert upstream.calls.last.request.headers["authorization"] == "Bearer client-oauth"
+
+
+@pytest.mark.asyncio
+async def test_copilot_marker_does_not_change_management_auth(
+    copilot_proxy: object, respx_mock: respx.MockRouter
+) -> None:
+    request: Final = Request({
+        "type": "http", "method": "GET", "path": "/user/info",
+        "headers": [(b"authorization", f"Bearer {MASTER_KEY}".encode()), (b"x-copilot-inference-gateway", b"true")],
+    })
+    auth: Final = await user_api_key_auth(
+        request=request, api_key=f"Bearer {MASTER_KEY}", azure_api_key_header="",
+        anthropic_api_key_header=None, google_ai_studio_api_key_header=None, azure_apim_header=None,
+        custom_litellm_key_header=None,
+    )
+    assert auth.user_role == LitellmUserRoles.PROXY_ADMIN
+    assert not respx_mock.calls
 
 
 class _RoutingRequest:

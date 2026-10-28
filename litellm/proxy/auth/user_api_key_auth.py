@@ -118,6 +118,13 @@ from litellm.proxy.auth.auth_utils import (
     request_dispatched_to_provider_pass_through,
     route_in_additonal_public_routes,
 )
+from litellm.proxy.auth.github_copilot_auth import (
+    CopilotAuthFailure,
+    authenticate_copilot_request,
+    copilot_auth_endpoint,
+    copilot_credential_id,
+    raise_copilot_auth_failure,
+)
 from litellm.proxy.auth.handle_jwt import JWTAuthManager, JWTHandler
 from litellm.proxy.auth.network import TrustedProxyConfig, resolve_network_context
 from litellm.proxy.auth.oauth2_check import Oauth2Handler
@@ -2121,6 +2128,13 @@ async def user_api_key_auth_builder(
     except Exception:
         pass
     route: Final[str] = get_request_route(request=request)
+    copilot_endpoint: Final = (
+        copilot_auth_endpoint(
+            request, route, _GENERAL_SETTINGS_ADAPTER.validate_python(general_settings).get("pass_through_endpoints")
+        )
+        if request_dispatched_to_pass_through_endpoint(request)
+        else None
+    )
     valid_token: UserAPIKeyAuth | None = None
     custom_auth_api_key: bool = False
 
@@ -2130,6 +2144,31 @@ async def user_api_key_auth_builder(
                 request_data=request_data,
                 request=request,
                 route=route,
+            )
+        if copilot_endpoint is not None:
+            from litellm.llms.custom_httpx.http_handler import (
+                get_async_httpx_client,  # pyright: ignore[reportUnknownVariableType]  # legacy optional params
+            )
+
+            _ensure_parent_otel_span_on_request_state(request)
+            copilot_result: Final = await authenticate_copilot_request(
+                request,
+                endpoint=copilot_endpoint,
+                client=get_async_httpx_client(llm_provider="github_copilot_auth").client,
+                cache=user_api_key_cache,
+                grants=GrantResolver(
+                    prisma_client,
+                    user_api_key_cache,
+                    parent_otel_span=getattr(request.state, "parent_otel_span", None),
+                    proxy_logging_obj=proxy_logging_obj,
+                ),
+            )
+            if isinstance(copilot_result, CopilotAuthFailure):
+                raise_copilot_auth_failure(copilot_result)
+            copilot_request_state: Final = request.state
+            copilot_request_state.github_copilot_authenticated = True
+            return copilot_result.model_copy(
+                update={"parent_otel_span": getattr(request.state, "parent_otel_span", None)}
             )
         pass_through_endpoints: Final[list[dict] | None] = general_settings.get("pass_through_endpoints", None)
         ## CHECK IF X-LITELM-API-KEY IS PASSED IN - supercedes Authorization header
@@ -2844,8 +2883,9 @@ async def user_api_key_auth_builder(
             request_data=request_data,
             route=route,
             parent_otel_span=parent_otel_span,
-            api_key=api_key,
+            api_key=copilot_credential_id(request.headers.get("authorization", "")) if copilot_endpoint else api_key,
             resolved_identity=valid_token,
+            allow_db_unavailable=copilot_endpoint is None,
         )
 
 
@@ -4056,6 +4096,7 @@ async def _authorize_authenticated_request(
     api_key: str,
     *,
     force_virtual_key_checks: bool = False,
+    allow_db_unavailable: bool = True,
 ) -> UserAPIKeyAuth | None:
     """Authorize an already-authenticated request: disabled-route check, the single
     ``common_checks`` gate (which also reserves budget), and end-user fallback
@@ -4140,6 +4181,7 @@ async def _authorize_authenticated_request(
             parent_otel_span=user_api_key_auth_obj.parent_otel_span,
             api_key=api_key,
             resolved_identity=user_api_key_auth_obj,
+            allow_db_unavailable=allow_db_unavailable,
         )
 
     # Defense-in-depth: ``_user_api_key_auth_builder`` has multiple early-return
@@ -4309,12 +4351,17 @@ async def user_api_key_auth(
         # only the endpoint's post-call path releases; the endpoint never runs, since
         # the parse failure is raised below.
         if body_parse_exception is None:
+            uses_copilot_auth: Final = getattr(request.state, "github_copilot_authenticated", False) is True
             recovered_auth_obj: Final = await _authorize_authenticated_request(
                 user_api_key_auth_obj=user_api_key_auth_obj,
                 request=request,
                 request_data=request_data,
                 route=route,
-                api_key=api_key,
+                api_key=copilot_credential_id(request.headers.get("authorization", ""))
+                if uses_copilot_auth
+                else api_key,
+                force_virtual_key_checks=uses_copilot_auth,
+                allow_db_unavailable=not uses_copilot_auth,
             )
             if recovered_auth_obj is not None:
                 return recovered_auth_obj

@@ -22,6 +22,7 @@ class GithubHostEndpoints:
     access_token_url: str
     api_key_url: str
     user_url: str
+    copilot_user_url: str
     client_id: str
     copilot_api_hosts: frozenset[str]
     copilot_api_host_suffix: str | None
@@ -56,6 +57,7 @@ def github_host_endpoints(host: str) -> GithubHostEndpoints:
             access_token_url=os.getenv("GITHUB_COPILOT_ACCESS_TOKEN_URL", DEFAULT_GITHUB_ACCESS_TOKEN_URL),
             api_key_url=os.getenv("GITHUB_COPILOT_API_KEY_URL", DEFAULT_GITHUB_API_KEY_URL),
             user_url="https://api.github.com/user",
+            copilot_user_url="https://api.github.com/copilot_internal/user",
             client_id=client_id,
             copilot_api_hosts=frozenset({"githubcopilot.com"}),
             copilot_api_host_suffix=".githubcopilot.com",
@@ -71,6 +73,7 @@ def github_host_endpoints(host: str) -> GithubHostEndpoints:
         access_token_url=f"https://{normalized}/login/oauth/access_token",
         api_key_url=f"https://{api_host}/copilot_internal/v2/token",
         user_url=f"https://{api_host}/user",
+        copilot_user_url=f"https://{api_host}/copilot_internal/user",
         client_id=client_id,
         copilot_api_hosts=frozenset({copilot_api_host}),
         copilot_api_host_suffix=None,
